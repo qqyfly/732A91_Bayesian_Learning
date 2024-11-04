@@ -1,0 +1,698 @@
+---
+title: "Bayesian Learning Lab 3"
+author: 
+  - Qinyuan Qi(qinqi464)
+  - Satya Sai Naga Jaya Koushik	Pilla (satpi345)
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup}
+# ===================================================================
+# Init Library
+# ===================================================================
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(gridExtra)
+library(readxl)
+library(LaplacesDemon)
+library(MASS)
+library(matrixStats)
+library(mvtnorm)
+library(rstan)
+library(loo)
+library(coda)
+
+
+library(BayesLogit)
+rstan_options(auto_write = TRUE)
+Sys.setenv(LOCAL_CPPFLAGS = '-march=native')
+```
+
+# 1. Gibbs sampling for the logistic regression
+
+```{r 1_init,echo = FALSE}
+#--------------------------------------------------------------------
+# Init code for question 1
+#--------------------------------------------------------------------
+rm(list = ls())
+```
+According to the question, we have prior distribution as follows:
+
+$$
+\beta \sim N(0, \tau^{2}I) \ \text{where} \ \tau = 3
+$$
+
+and we have the following logistic regression model, if y=1 means woman works and 0 means woman not work.
+
+$$
+Pr(y=1|x,\beta) = \frac{exp(x^T\beta)}{1+exp(x^T\beta)}
+$$
+
+Using the Polya-Gamma latent variables $\omega_i$, the likelihood can be augmented as follows:
+
+$$
+Pr(y_i=1|x_i,\beta) = \frac{exp(x_{i}^T\beta)}{1+exp(x_{i}^T\beta)}
+$$
+
+According to the L7 Slide24, we know that to simulate from the joint posterior $p(\omega,\beta|y)$ we will use the following formulas:
+
+$$
+\omega_i | \beta \sim PG(1, x_{i}^T\beta)
+$$
+
+
+$$
+\beta|y,\omega \sim N(m_{\omega},V_{\omega})
+$$
+
+$$
+V_{\omega} = ((X^T \Omega X + B^{-1}))^{-1}
+$$
+
+$$
+m_{\omega} = V_{\omega} ((X^T k + B^{-1}b))
+$$
+
+$$
+B = \tau^2 * I
+$$
+
+
+## 1.a Implement a Gibbs sampler that simulates from the joint posterior
+
+Code as follows.
+
+```{r 1a_1,echo = TRUE}
+#--------------------------------------------------------------------
+# load the data
+#--------------------------------------------------------------------
+WomenAtWork = read.table("WomenAtWork.dat", header = TRUE)
+y = WomenAtWork$Work
+X = WomenAtWork[,2:8]
+X = as.matrix(X)
+Xnames <- colnames(X)
+
+tau <- 3
+
+#get dimensions
+n <- nrow(X)
+p <- ncol(X)
+```
+
+```{r 1a_2,echo = TRUE}
+
+set.seed(12345)
+
+# Initialize parameters
+beta <- rep(0, p)
+
+# Number of iterations
+n_iter <- 3000
+
+burn_in = 200
+
+beta_samples <- matrix(0, ncol = p, nrow = n_iter)
+omega <- rep(1, n)
+
+# B = tao^2 * I 
+B <- diag(tau^2, p)
+
+# Gibbs Sampling
+for (iter in 1:n_iter) {
+    # draw samples using rpg function
+    omega <- rpg(n, 1, X %*% beta)
+    
+    # Update beta according to the formula mentioned previously
+    V_beta <- solve(t(X) %*% diag(omega) %*% X + B)
+    # b = 0 and k = (y - 0.5)
+    m_beta <- V_beta %*% t(X) %*% (y - 0.5)
+    beta <- mvrnorm(1, mu = m_beta, Sigma = V_beta)
+    
+    # Store samples
+    beta_samples[iter, ] <- beta
+  }
+
+# Remove burn-in samples
+beta_samples <- beta_samples[-(1:burn_in), ]
+
+# Convert samples to mcmc object
+mcmc_samples <- as.mcmc(beta_samples)
+summary_stats <- summary(mcmc_samples)
+```
+
+Ineciency Factors (IFs) and trajectories of the sampled Markov chains are printed and plotted below:
+
+```{r 1a_3,echo = FALSE}
+# print out the summary and the time-series standard error
+print(summary_stats)
+print(summary_stats$statistics[,"Time-series SE"])
+
+# Plot trajectories of the sampled Markov chains
+par(mfrow = c(2, 2))
+for (j in 1:ncol(beta_samples)) {
+  plot(beta_samples[, j], type = "l", main = Xnames[j],
+       xlab = "Iteration", ylab = "Sample value")
+}
+```
+
+## 1.b compute a 90% equal tail credible interval
+
+```{r 1b_0,echo = TRUE}
+# Define the predictor vector x
+# a husband with an income of 22
+# 12 years of education
+# 7 years of exp erience,
+# a 38-year-old woman,
+# one child (3 years old)
+x_new <- c(1, 22, 12, 7, 38, 1, 0)
+
+probabilities <- apply(beta_samples, 1, function(beta) {
+  exp(sum(beta * x_new)) / (1 + exp(sum(beta * x_new)))
+})
+
+# Compute the 90% equal tail credible interval for the probabilities
+credible_interval <- quantile(probabilities, probs = c(0.05, 0.95))
+print(credible_interval)
+```
+
+# 2 Metropolis Random Walk for Poisson regression
+
+We have the following Poisson regression model as follows:
+
+$$
+y_{i}|\beta \overset{\text{iid}}{\sim} Possion[exp(x_{i}^{T}\beta)] \,  \ i = 1,...,n
+$$
+
+
+```{r 2_init,echo = FALSE, eval=TRUE}
+#--------------------------------------------------------------------
+# Init code for question 2
+#--------------------------------------------------------------------
+rm(list = ls())
+ebay_data <- read.table("eBayNumberOfBidderData_2024.dat", header = T)
+```
+
+## 2.a Obtain the maximum likelihood estimator of $\beta$ in the Poisson regression model for the eBay data
+
+```{r 2a_0,echo = TRUE, eval=TRUE}
+#--------------------------------------------------------------------
+# code for question 2.a
+#--------------------------------------------------------------------
+# remove covariate const (2nd column)
+data_noconst <- ebay_data[,-2]
+glm_model <- glm(nBids ~ ., family = poisson(link = "log"), data = data_noconst)
+summary(glm_model)
+```
+
+According to the Pr value in the summary of the glm model, we can find the significant 
+covariates as follows:
+
+- (Intercept)
+- VerifyID
+- Sealed
+- MinBidShare
+
+## 2.b Bayesian analysis of the Poisson regression
+
+According to the question, we have prior distribution as follows:
+
+$$
+\beta \sim N(0, 100 \cdot (X^{T}X)^{-1}]
+$$
+
+Where X is the n x p matrix of covariates.
+
+We assume the posterior density is approximately multivariate normal as follows:
+
+$$
+\beta|y,x \sim N(\tilde{\beta}, J^{-1}_{y}(\tilde{\beta}))
+$$
+
+Where $\tilde{\beta}$ is the posterior mode and
+$J(\tilde{\beta})$ is the negative Hessian at the posterior mode.
+
+We know that the PMF of Poisson distribution is:
+
+$$
+P(Y|X,\beta) = \frac{ \lambda^{Y} exp(-\lambda)} {Y!}, \ where \ \lambda = exp(X^T\beta) 
+$$
+
+$$
+P(Y_i|X_i,\beta) = \prod_{i} \frac{ exp(y_i x^T\beta) exp(-exp(x_i^T\beta) } {y!}
+$$
+
+$$
+Likehood(\beta|X,Y) = \prod_{i} \frac{ exp(y_i x^T\beta) exp(-exp(x_i^T\beta) } {y!}
+$$
+
+We apply log on both sides.
+
+$$
+LogLikehood(\beta|X,Y) = \sum_{i}(y_i x^T\beta - exp(x_i^T\beta) - log(y!)) \sim \sum_{i}( y_i x^T\beta - exp(x_i^T\beta))
+$$
+
+To use optim , we need to implement the following function to calculate the optimized $\tilde{\beta}$ and $J^{-1}_{y}(\tilde{\beta})$.
+
+
+
+```{r 2b_0,echo = TRUE, eval=TRUE}
+#--------------------------------------------------------------------
+# code for question 2.b
+#--------------------------------------------------------------------
+logPost <- function(beta,X=covariates,Y=response){
+  linPred <- X%*%beta;
+  logLik <- sum(Y * linPred - exp(linPred));  
+  logPrior <- dmvnorm(t(beta), 
+                      mean = matrix(0,nrow=ncol(X)), 
+                      sigma = 100 * (solve(t(X) %*% X)), 
+                      log=TRUE);
+  return(logLik + logPrior)
+}
+```
+We will optimize the logPost function to get the posterior mode $\tilde{\beta}$.
+
+```{r 2b_1,echo = TRUE, eval=TRUE}
+# get response and covariates from original data
+response <- as.matrix(ebay_data$nBids)
+covariates <- as.matrix(ebay_data[,2:10])
+
+# initial values
+init_val <- matrix(1,nrow=9);
+
+# optimize the log posterior
+OptimRes <- optim(par = init_val,
+                  fn = logPost,                                    
+                  method=c("BFGS"),
+                  control=list(fnscale=-1),
+                  hessian=TRUE)
+# set values to print out
+posterior_mode  <- OptimRes$par
+beta_jacobian <- -OptimRes$hessian
+beta_inverse_jacobian <- solve(beta_jacobian) 
+```
+
+```{r 2b_2,echo = FALSE, eval=TRUE}
+#--------------------------------------------------------------------
+# print values
+#--------------------------------------------------------------------
+rownames(posterior_mode) <- colnames(covariates)
+print('The posterior beta is:')
+print(t(posterior_mode))
+print('The glm_model coefficients is:')
+print(glm_model$coefficients)
+print('The beta_inverse_jacobian is:')
+print(beta_inverse_jacobian)
+```
+
+From the output of posterior beta and glm_model's coefficients, we can find that the results are similar.
+
+## 2.c Simulate from the actual posterior of $\beta$ using the Metropolis algorithm and compare the results with the approximate results in b)
+
+The proposal density is multivariate normal density which given by:
+
+$$
+\theta_{p}|\theta^{(i-1)} \sim N(\theta^{(i-1)},c \cdot \Sigma) 
+$$
+
+where $\sum =J_{y}^{-1}(\tilde{\beta})$ was obtained in 2.b.
+
+
+```{r 2c_0,echo = TRUE, eval=TRUE}
+#--------------------------------------------------------------------
+# code for question 2.c
+#--------------------------------------------------------------------
+#--------------------------------------------------------------------
+#  metropolis function
+#--------------------------------------------------------------------
+metropolis_fn <- function(tgt_density, c, theta_i, sigma_proposal, steps, X, Y){
+  # init seed
+  set.seed(12345)
+
+  result <- matrix(t(theta_i), ncol=9)
+  accepted_count <- 0
+
+  for(i in 1:steps){
+    # generate sample from proposal
+    theta_p <- rmvnorm(n = 1, mean = as.vector(theta_i), sigma = c * sigma_proposal)
+    
+    # calculate acceptance ratio
+    acceptance_ratio <- tgt_density(as.vector(theta_p), X, Y) - 
+                        tgt_density(as.vector(theta_i), X, Y)
+
+    # apply exp to acceptance ratio(since original one is in log)
+    acceptance_ratio <- exp(acceptance_ratio)
+
+    # calculate alpha
+    alpha <- min(1, acceptance_ratio)
+
+    # draw from  uniform distribution
+    u <- runif(1)
+
+    # accept or reject
+    if (u < alpha){
+      theta_i <- theta_p
+      accepted_count <- accepted_count + 1      
+      result <- rbind(result, theta_i)      
+    }else{
+      result <- rbind(result, as.vector(theta_i))
+    }    
+  }
+  acceptance <- accepted_count / steps
+  return(list(result = result, acceptance = acceptance))    
+}
+```
+
+We choose the same prarms for prior of target density.
+
+```{r 2c_1,echo = TRUE, eval=TRUE}
+#--------------------------------------------------------------------
+# function call to run metropolis
+#--------------------------------------------------------------------
+sigma_proposal <- beta_inverse_jacobian
+theta_init <- matrix(rep(0.5,9), ncol=9)
+
+# run metropolis
+metropolis_val <- metropolis_fn(tgt_density = logPost, 
+                                c = 0.5,
+                                theta_i = theta_init,
+                                sigma_proposal = sigma_proposal,
+                                steps = 1000,
+                                X  = covariates,
+                                Y = response)
+
+metropolis_result <- metropolis_val$result
+colnames(metropolis_result) <- rownames(posterior_mode)
+metropolis_result_mean <- apply(metropolis_result, 2, mean)
+names(metropolis_result_mean) <- rownames(posterior_mode)
+metropolis_accept <- metropolis_val$acceptance
+```
+
+```{r 2c_2,echo = FALSE,eval=TRUE}
+print('The metropolis_result_mean is:')
+print(metropolis_result_mean)
+print('The metropolis_accept is:')
+print(metropolis_accept)
+print('shape of metropolis_result is:')
+print(dim(metropolis_result))
+```
+
+Then we plot the result of the metropolis coefficients as follows:
+
+```{r 2c_3,echo = FALSE, eval=TRUE}
+#--------------------------------------------------------------------
+# plot
+#--------------------------------------------------------------------
+par(mfrow = c(3,3))
+for(i in 1:9){
+  plot((metropolis_result[,i]), type="l", ylab= colnames(metropolis_result)[i],xlab = "steps")
+}
+
+```
+
+We change diffent value of c ,theta_init and steps, al the covariates are convergent 
+very fast, but when we change the value c and theta_init, the burn-in period will be different.
+And when steps is large,the convergence will be more stable.
+
+## 2.d Use the MCMC draws from c) to simulate from the predictive distribution and plot
+
+Now we use MCMC to draw coefficients from 2.c.
+
+The probability of no bidders is around 0.0475.
+
+```{r 2d_0,echo = TRUE, eval=TRUE}
+#--------------------------------------------------------------------
+# code for question 2.d
+#--------------------------------------------------------------------
+new_data <- c(1, 1, 0, 1, 0, 1, 0, 1.2, 0.8)
+result2 <- data.frame(matrix(0, nrow = nrow(metropolis_result), ncol = 9))
+
+for(i in 1:nrow(metropolis_result)){
+  lambda <- exp(new_data %*% as.numeric(metropolis_result[i,]))
+  result2[i,] <- rpois(1, lambda)
+}
+```
+
+```{r 2d_1,echo = FALSE, eval=TRUE}
+#--------------------------------------------------------------------
+# plot
+#--------------------------------------------------------------------
+print("Probability of no bidders is:")
+print(mean(result2 == 0))
+hist(result2[,1], main = "Predictive distribution", xlab = "Bidders",breaks = 30, freq = FALSE)
+lines(density(result2[,1]),lwd=1,col="blue")
+```
+
+# 3 Time series models in Stan
+
+```{r 3_init,echo = FALSE, eval=TRUE}
+#--------------------------------------------------------------------
+# Code for question 3
+#--------------------------------------------------------------------
+rm(list = ls())
+```
+## 3.a Write a function in R that simulates data from the AR(1)-process
+
+According to the question, AR(1) process is defined as follows:
+
+$$
+x_{t} = \mu +\phi(x_{t-1}-\mu)+\epsilon_{t}, \epsilon_{t} \overset{\text{iid}}{\sim} N(0,\sigma^{2})
+$$
+
+According to the question, the parameters listed below:
+
+```{r 3a_0,echo = TRUE, eval=TRUE}
+#--------------------------------------------------------------------
+# code for question 3.a
+#--------------------------------------------------------------------
+#----------------------------------------------
+# Parameters for AR(1) process
+#----------------------------------------------
+phis <- seq(-0.99, 0.99, by = 0.20)
+sigma2 <- 4
+mu <- 9
+T <- 250
+```
+Then we define the function to simulate AR(1) process:
+
+```{r 3a_1,echo = TRUE, eval=TRUE}
+#----------------------------------------------
+# Function to simulate AR(1) process
+#----------------------------------------------
+simulate_ar1 <- function(mu=9, phi, sigma2=4, T=250) {
+  # init variables
+  n <- length(phis)
+  values <- data.frame(0,ncol = n)
+  
+  for(i in 1:n){
+    x = mu
+    values[1,i] = x
+
+    for (j in 2:T) {
+        x <- mu + phi[i] * (x - mu) + rnorm(1, 0, sqrt(sigma2))
+        values[j,i] = x
+    }    
+  }
+  # set column names
+  colnames(values) <- paste("phi_",phi)
+  return(values)
+}
+
+# function call
+ar1 <- simulate_ar1(mu = mu, phi = phis, sigma2 = sigma2,T = T)
+```
+
+
+```{r 3a_plot,echo = FALSE, eval=TRUE}
+#----------------------------------------------
+# Plot AR(1) process simulated data
+#----------------------------------------------
+# set layout to 2 x 3
+par(mfrow = c(2,3))
+for(i in 1:length(phis)){
+  plot(ar1[,i], type = 'l', ylab = paste("phi = ", phis[i]), xlab = "T")
+}
+```
+
+From the plots above , we can found that smaller value of $\theta$ has much larger effect on the next prediction of 
+$x_t$. The reason stated as below:
+
+From the formula of the AR(1) process, we know that $\mu=13$ is fixed in our case, when $\phi$ is close to -1, 
+The first two terms of the equation cancel each other out and get close to 0, the third term of the equation, 
+which is random variable $\epsilon_t$  will play a more important role in the prediction of $x_t$. As a result, 
+the predicted value of $x_t$ will greatly effected by random variable $\epsilon_t$, so it has a negative correlation. 
+But when $\phi$ is close to 1, the first two items will become a positive value which make $\phi$ positive correlation
+to the prediction of $x_t$.
+
+
+## 3.b Use your function from a) to simulate two AR(1)-processes
+
+According to the question, we assume that $\mu,\phi,\sigma^2$ are unknown parameters.
+And we choose non-informative priors of those 3 parameters are as follows:
+
+$$
+\mu \sim N(0,50)
+$$
+
+$$
+\sigma^2 \sim Inv-\chi^2(1,10)
+$$
+
+$$
+\phi \sim Uniform(-1,1)
+$$
+
+
+$x_{1:T}$ with $\phi=0.3$ and $y_{1:T}$ with $\phi=0.97$.
+
+Since model assumes that each observation is a linear combination of the previous observation 
+and a random term $\epsilon_t$, so AR(1)-processes will generated x will follow a normal distribution.
+
+$$
+x_{t}|x_{t-1} \sim N(\mu +\phi(x_{t-1}-\mu),\sigma_{\epsilon}^{2})
+$$
+
+using the code in [stan guide](https://mc-stan.org/docs/2_18/stan-users-guide/autoregressive-section.html)
+as a reference, we can write the stan code as follows:
+
+```{r 3b_0_0,echo = TRUE,eval=TRUE, eval=TRUE}
+
+#--------------------------------------------------------------------
+# code for question 3.b
+#--------------------------------------------------------------------
+
+model_AR <- simulate_ar1(phi = c(0.3, 0.97))
+
+StanModel = '
+data {
+  int<lower=0> N; // Number of observations
+  vector[N] x;    // x_t
+}
+parameters {
+  real mu;
+  real<lower = 0> sigma2;
+  real<lower = -1, upper = 1> phi;
+}
+model {
+  mu ~ normal(0,50); 
+  sigma2 ~ scaled_inv_chi_square(1,10); 
+  phi ~ uniform(-1,1);
+  
+  for(i in 2:N){
+    x[i] ~ normal(mu + phi * (x[i-1] - mu), sqrt(sigma2));
+  }
+}'
+
+```
+
+### 3.b.i Report the posterior mean, 95% credible intervals and the number of effective posterior samples for the three inferred parameters for each of the simulated AR(1)-process
+
+```{r 3b_i_1,echo = TRUE,eval=TRUE, eval=TRUE}
+
+#--------------------------------------------------------------------
+# code for question 3.b.i
+#--------------------------------------------------------------------
+#fit model for phi 0.3
+fit_0.3 = stan(model_code = StanModel,
+               data = list(x = model_AR$`phi_ 0.3`, N = 250),
+               warmup = 1000,
+               iter = 2000,
+               chains = 4)
+
+#fit model for phi 0.97
+fit_0.97 = stan(model_code = StanModel,
+               data = list(x = model_AR$`phi_ 0.97`, N = 250),
+               warmup = 1000,
+               iter = 2000,
+               chains = 4)
+
+post_samples_0.3 <- extract(fit_0.3)
+post_mean_0.3 <- get_posterior_mean(fit_0.3)
+post_samples_0.97 <- extract(fit_0.97)
+post_mean_0.97 <- get_posterior_mean(fit_0.97)     
+```
+
+```{r 3b_i_2,eval=TRUE, eval=TRUE}
+#--------------------------------------------------------------------
+# code for question 3.b.ii
+#--------------------------------------------------------------------
+post_samples_0.3_df <- data.frame(mu = post_samples_0.3$mu, 
+                                  sigma2 = post_samples_0.3$sigma2, 
+                                  phi = post_samples_0.3$phi)
+
+post_samples_0.97_df <- data.frame(mu = post_samples_0.97$mu, 
+                                  sigma2 = post_samples_0.97$sigma2, 
+                                  phi = post_samples_0.97$phi)   
+
+CI_0.3 <- sapply(post_samples_0.3_df, function(x) quantile(x, probs = c(0.025, 0.975)))
+CI_0.97 <- sapply(post_samples_0.97_df, function(x) quantile(x, probs = c(0.025, 0.975)))
+
+```
+
+```{r 3b_i_3,echo = FALSE,eval=TRUE}
+#--------------------------------------------------------------------
+# print
+#--------------------------------------------------------------------
+print("Posterior means when phi = 0.3 :")
+print(post_mean_0.3)
+print("Posterior means when phi = 0.97 :")
+print(post_mean_0.97)
+
+print("Posterior 95% CI when phi=0.3 :")
+print(CI_0.3)
+print("Posterior 95% CI when phi=0.97 :")
+print(CI_0.97)
+```
+
+We can estimate the true values within suitable confidence interval. for example,95% confidence interval.
+
+### 3.b.ii evaluate the convergence of the samplers and plot the joint posterior of $\mu$ and $\phi$.
+
+We will plot the models for $\phi = 0.3$ and $\phi = 0.97$.
+
+```{r 3b_ii_1,echo = FALSE,eval=TRUE}
+#--------------------------------------------------------------------
+# plot
+#--------------------------------------------------------------------
+par(mfrow = c(2,1))
+plot(y=model_AR[,1],x=c(1:250),type='l',ylab='phi = 0.3',xlab='T')
+plot(y=model_AR[,2],x=c(1:250),type='l',ylab='phi = 0.97',xlab='T')
+```
+
+then we  plot the convergence of the samplers and the joint posterior
+
+```{r 3b_ii_2,echo = FALSE,eval=FALSE}
+par(mfrow = c(2,2))
+plot(post_samples_0.3$mu, type = 'l', ylab="posterior mu",main="phi = 0.3")
+plot(post_samples_0.97$mu, type = 'l', ylab="posterior mu",main="phi = 0.97")
+
+plot(post_samples_0.3$sigma2, type = 'l', ylab="posterior sigma2",main="phi = 0.3")
+plot(post_samples_0.97$sigma2, type = 'l', ylab="posterior sigma2",main="phi = 0.97")
+
+plot(post_samples_0.3$phi, type = 'l', ylab="posterior phi",main="phi = 0.3")
+plot(post_samples_0.97$phi, type = 'l', ylab="posterior phi",main="phi = 0.97")
+```
+
+```{r 3b_ii_3,echo = FALSE,eval=TRUE}
+
+par(mfrow = c(1,2))
+
+plot(post_samples_0.3$mu, post_samples_0.3$phi, type = 'p',
+    xlab = "mu", ylab = "phi", main = "phi = 0.3")
+plot(post_samples_0.97$mu, post_samples_0.97$phi, type = 'p', 
+    xlab = "mu", ylab = "phi", main = "phi = 0.97")
+```
+
+All parameters are not convergent to a stable value but fluctuate around a value.
+
+From the joint posterior plots above, we can find that $\mu$ is more accurate when $\phi=0.3$. 
+and when $\phi$ get bigger, the distribution of $\mu$ becomes very wide.
+
+
+\newpage
+
+# APPENDIX: CODE
+
+
+```{r ref.label= knitr::all_labels(), echo=TRUE, eval=FALSE}
+```
